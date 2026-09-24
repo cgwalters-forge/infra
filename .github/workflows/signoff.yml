@@ -1,0 +1,20 @@
+# TEST ONLY on cgwalters-forge/infra: the stub from bot/pr-signoff, pointed at
+# the forge actions branch, without App credentials (GITHUB_TOKEN fallback).
+name: PR signoff command
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  signoff:
+    if: >-
+      github.event.issue.pull_request &&
+      (startsWith(github.event.comment.body, '/signoff') ||
+       startsWith(github.event.comment.body, '/rebase-signoff'))
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: cgwalters-forge/actions/.github/workflows/pr-signoff.yml@bot/pr-signoff
