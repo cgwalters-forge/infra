@@ -99,11 +99,16 @@ jobs:
       # Smoke-test: boot the image in a VM and verify all systemd services
       # started successfully. This catches images broken by rechunking.
       # Only amd64 — GitHub arm64 runners lack /dev/kvm (no nested KVM).
+      #
+      # bootloader-update.service is masked because an ephemeral VM's root is
+      # virtiofs with no backing block device, so `bootupctl update` fails.
+      # Drop the mask once https://github.com/coreos/bootupd/pull/1072 ships
+      # in all the base images.
       - name: Boot and test staged image
         if: matrix.arch == 'amd64'
         run: |
           image="localhost/${{ matrix.name }}:${{ matrix.tag }}"
-          bcvk ephemeral run-ssh "${image}" -- bash -c '
+          bcvk ephemeral run-ssh --karg systemd.mask=bootloader-update.service "${image}" -- bash -c '
             state=$(systemctl is-system-running)
             if [ "$state" != "running" ]; then
               echo "System state: $state"
