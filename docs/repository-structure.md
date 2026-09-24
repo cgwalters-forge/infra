@@ -31,6 +31,20 @@ Each repository MUST enable the following settings via a branch protection rule 
 - Require a pull request before merging
 - Require approvals
 
+### DCO
+
+The organization's `default` ruleset requires the `DCO` check (from the
+[dco-2](https://github.com/apps/dco-2) App) on every repository: each commit
+needs a `Signed-off-by` matching its author or committer. When a contributor
+forgot it, a maintainer can comment `/signoff` on the PR to add their own
+`Signed-off-by` to all of its commits without changing them otherwise, or
+`/signoff <sha>` (at least 12 hex digits) to also pin the head they
+reviewed. `/rebase-signoff` also moves the commits onto the target branch.
+`/signoff` needs triage access (write for PRs from forks, whose CI the
+push then runs), and `/rebase-signoff` needs write. The workflow is synced
+to every repository from `common/.github/workflows/signoff.yml`; the logic
+is in [bootc-dev/actions](https://github.com/bootc-dev/actions#pr-signoff).
+
 ### required-checks
 
 Having some kind of CI is also required. Repositories SHOULD enable the automatic merge setting,
