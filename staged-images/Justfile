@@ -90,13 +90,7 @@ push image arch="":
 	rm -f "${digestfile}"
 	echo "${digest}"
 
-# Generate GHA matrices from sources.json (used by CI workflow)
+# Generate the per-image GHA matrix from sources.json (used by CI workflow)
 [private]
 ci-matrix:
-	@jq -c '[.[] | . as $img | {name: ($img.name + "-staged"), tag: $img.tag, image_key: ($img.name + "-" + $img.tag), arch: "amd64", runner: "ubuntu-24.04"}, {name: ($img.name + "-staged"), tag: $img.tag, image_key: ($img.name + "-" + $img.tag), arch: "arm64", runner: "ubuntu-24.04-arm"}] | unique_by([.name, .tag, .arch]) | {include: .}' "{{_sources}}"
-[private]
-ci-mirror-matrix:
-	@jq -c '[.[] | {name: .name, tag: .tag, source: .source, mirror_name: (.name + "-source")}] | unique_by([.name, .tag]) | {include: .}' "{{_sources}}"
-[private]
-ci-manifest-matrix:
-	@jq -c '[.[] | {name: (.name + "-staged"), tag: .tag}] | unique_by([.name, .tag]) | {include: .}' "{{_sources}}"
+	@jq -c '[.[] | {name, tag}] | unique_by([.name, .tag]) | {include: .}' "{{_sources}}"

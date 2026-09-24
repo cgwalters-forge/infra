@@ -5,11 +5,13 @@ on:
     branches: [main]
     paths:
       - 'staged-images/**'
+      - '.github/workflows/staged-image-pipeline.yml'
       - '.github/workflows/build-staged-images.yml'
   pull_request:
     branches: [main]
     paths:
       - 'staged-images/**'
+      - '.github/workflows/staged-image-pipeline.yml'
       - '.github/workflows/build-staged-images.yml'
   schedule:
     # Rebuild weekly to pick up upstream base image updates
@@ -20,139 +22,31 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  REGISTRY: ghcr.io
-
-# Job flow:
-#   PR:                 generate-matrix → build + test
-#   push/schedule:      generate-matrix → mirror → build + test → push → manifest
 jobs:
-  # Read sources.json and generate matrices for downstream jobs.
+  # Read sources.json and generate the per-image matrix.
   generate-matrix:
     name: Generate matrix
     runs-on: ubuntu-24.04
     outputs:
-      mirror: ${{ steps.matrix.outputs.mirror }}
-      build: ${{ steps.matrix.outputs.build }}
-      manifest: ${{ steps.matrix.outputs.manifest }}
+      images: ${{ steps.matrix.outputs.images }}
     steps:
       - uses: actions/checkout@v7
       - uses: extractions/setup-just@v4
       - id: matrix
-        run: |
-          echo "mirror=$(just staged-images/ci-mirror-matrix)" >> "$GITHUB_OUTPUT"
-          echo "build=$(just staged-images/ci-matrix)" >> "$GITHUB_OUTPUT"
-          echo "manifest=$(just staged-images/ci-manifest-matrix)" >> "$GITHUB_OUTPUT"
+        run: echo "images=$(just staged-images/ci-matrix)" >> "$GITHUB_OUTPUT"
 
-  # Mirror upstream source images to GHCR so we have our own copy.
-  # Upstream registries (quay.io) may delete old manifests, breaking
-  # digest-pinned pulls.
-  mirror:
-    name: Mirror ${{ matrix.name }}:${{ matrix.tag }}
+  # Each image runs through its own instance of staged-image-pipeline.yml, so
+  # its jobs gate only on that image's results.
+  image:
+    name: ${{ matrix.name }}:${{ matrix.tag }}
     needs: generate-matrix
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.generate-matrix.outputs.mirror) }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: bootc-dev/actions/bootc-ubuntu-setup@main
-      - name: Log in to GHCR
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | \
-            podman login -u "${{ github.actor }}" --password-stdin ${{ env.REGISTRY }}
-      - name: Mirror image
-        run: just staged-images/mirror ${{ matrix.name }}-${{ matrix.tag }}
-        env:
-          REGISTRY_OWNER: ${{ github.repository_owner }}
-
-  build:
-    name: Build ${{ matrix.name }}:${{ matrix.tag }} (${{ matrix.arch }})
-    needs: [generate-matrix, mirror]
-    if: ${{ !cancelled() }}
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.generate-matrix.outputs.build) }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: bootc-dev/actions/bootc-ubuntu-setup@main
-        with:
-          libvirt: ${{ matrix.arch == 'amd64' }}
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | \
-            podman login -u "${{ github.actor }}" --password-stdin ${{ env.REGISTRY }}
-      - name: Build staged image
-        run: just staged-images/build ${{ matrix.image_key }}
-        env:
-          SOURCE_FROM_MIRROR: ${{ github.event_name != 'pull_request' && '1' || '' }}
-          REGISTRY_OWNER: ${{ github.repository_owner }}
-      # Smoke-test: boot the image in a VM and verify all systemd services
-      # started successfully. This catches images broken by rechunking.
-      # Only amd64 — GitHub arm64 runners lack /dev/kvm (no nested KVM).
-      - name: Boot and test staged image
-        if: matrix.arch == 'amd64'
-        run: |
-          image="localhost/${{ matrix.name }}:${{ matrix.tag }}"
-          bcvk ephemeral run-ssh "${image}" -- bash -c '
-            state=$(systemctl is-system-running)
-            if [ "$state" != "running" ]; then
-              echo "System state: $state"
-              echo "Failed units:"
-              systemctl list-units --state=failed --no-legend
-              systemctl list-units --state=failed --no-legend --plain | while read -r unit _rest; do
-                echo "--- Status of $unit ---"
-                systemctl status "$unit" --no-pager --full 2>&1 || true
-              done
-              exit 1
-            fi
-          '
-      - name: Push by digest
-        if: github.event_name != 'pull_request'
-        id: push
-        run: |
-          digest=$(just staged-images/push ${{ matrix.image_key }} ${{ matrix.arch }})
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-        env:
-          REGISTRY_OWNER: ${{ github.repository_owner }}
-      - name: Upload digest artifact
-        if: github.event_name != 'pull_request'
-        run: |
-          mkdir -p "${{ runner.temp }}/digests"
-          echo "${{ steps.push.outputs.digest }}" > "${{ runner.temp }}/digests/${{ matrix.arch }}"
-      - uses: actions/upload-artifact@v7
-        if: github.event_name != 'pull_request'
-        with:
-          name: staged-digests-${{ matrix.name }}-${{ matrix.tag }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  manifest:
-    name: Manifest ${{ matrix.name }}:${{ matrix.tag }}
-    needs: [generate-matrix, build]
-    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.generate-matrix.outputs.manifest) }}
-    steps:
-      - uses: bootc-dev/actions/bootc-ubuntu-setup@main
-      - uses: bootc-dev/actions/create-manifest@main
-        with:
-          image: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}
-          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}:${{ matrix.tag }}
-          artifact-pattern: staged-digests-${{ matrix.name }}-${{ matrix.tag }}-*
-          registry-login-env: 'false'
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.images) }}
+    uses: ./.github/workflows/staged-image-pipeline.yml
+    with:
+      name: ${{ matrix.name }}
+      tag: ${{ matrix.tag }}
