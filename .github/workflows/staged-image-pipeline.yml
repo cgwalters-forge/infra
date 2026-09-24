@@ -1,0 +1,152 @@
+name: Build one chunkah-staged bootc base image
+
+# Reusable workflow, called once per image by build-staged-images.yml.
+# Having a workflow per image lets the jobs below gate on each other with
+# plain `needs` results that cover only this image: a failure in one image
+# never publishes a partial manifest, and never blocks the other images.
+#
+# Job flow:
+#   PR:             build + test
+#   push/schedule:  mirror → build + test → push → manifest
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: Source image name from sources.json, e.g. fedora-bootc
+        required: true
+        type: string
+      tag:
+        description: Source image tag from sources.json, e.g. 45
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_KEY: ${{ inputs.name }}-${{ inputs.tag }}
+  STAGED_NAME: ${{ inputs.name }}-staged
+
+jobs:
+  # Mirror the upstream source image to GHCR so we have our own copy.
+  # Upstream registries (quay.io) may delete old manifests, breaking
+  # digest-pinned pulls.
+  mirror:
+    name: Mirror
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: bootc-dev/actions/bootc-ubuntu-setup@main
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            podman login -u "${{ github.actor }}" --password-stdin ${{ env.REGISTRY }}
+      - name: Mirror image
+        run: just staged-images/mirror ${{ env.IMAGE_KEY }}
+        env:
+          REGISTRY_OWNER: ${{ github.repository_owner }}
+
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: mirror
+    # Outside of PRs the build pulls from the mirror, so it must only run
+    # after a successful mirror; otherwise it would silently build from
+    # whatever stale source the mirror tag last pointed to. PRs skip the
+    # mirror and build straight from upstream.
+    if: >-
+      ${{ !cancelled() && (needs.mirror.result == 'success' ||
+      (github.event_name == 'pull_request' && needs.mirror.result == 'skipped')) }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: bootc-dev/actions/bootc-ubuntu-setup@main
+        with:
+          libvirt: ${{ matrix.arch == 'amd64' }}
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            podman login -u "${{ github.actor }}" --password-stdin ${{ env.REGISTRY }}
+      - name: Build staged image
+        run: just staged-images/build ${{ env.IMAGE_KEY }}
+        env:
+          SOURCE_FROM_MIRROR: ${{ github.event_name != 'pull_request' && '1' || '' }}
+          REGISTRY_OWNER: ${{ github.repository_owner }}
+      # Smoke-test: boot the image in a VM and verify all systemd services
+      # started successfully. This catches images broken by rechunking.
+      # Only amd64 — GitHub arm64 runners lack /dev/kvm (no nested KVM).
+      #
+      # bootloader-update.service is masked because an ephemeral VM's root is
+      # virtiofs with no backing block device, so `bootupctl update` fails.
+      # Drop the mask once https://github.com/coreos/bootupd/pull/1072 ships
+      # in all the base images.
+      - name: Boot and test staged image
+        if: matrix.arch == 'amd64'
+        run: |
+          image="localhost/${{ env.STAGED_NAME }}:${{ inputs.tag }}"
+          bcvk ephemeral run-ssh --karg systemd.mask=bootloader-update.service "${image}" -- bash -c '
+            state=$(systemctl is-system-running)
+            if [ "$state" != "running" ]; then
+              echo "System state: $state"
+              echo "Failed units:"
+              systemctl list-units --state=failed --no-legend
+              systemctl list-units --state=failed --no-legend --plain | while read -r unit _rest; do
+                echo "--- Status of $unit ---"
+                systemctl status "$unit" --no-pager --full 2>&1 || true
+              done
+              exit 1
+            fi
+          '
+      - name: Push by digest
+        if: github.event_name != 'pull_request'
+        id: push
+        run: |
+          digest=$(just staged-images/push ${{ env.IMAGE_KEY }} ${{ matrix.arch }})
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+        env:
+          REGISTRY_OWNER: ${{ github.repository_owner }}
+      - name: Upload digest artifact
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          echo "${{ steps.push.outputs.digest }}" > "${{ runner.temp }}/digests/${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v7
+        if: github.event_name != 'pull_request'
+        with:
+          name: staged-digests-${{ env.STAGED_NAME }}-${{ inputs.tag }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Only publish when every arch built and tested successfully. Publishing
+  # after a partial failure would replace the multi-arch manifest with one
+  # missing that arch, breaking its consumers until the next good run.
+  manifest:
+    name: Manifest
+    needs: build
+    if: github.event_name != 'pull_request' && needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: bootc-dev/actions/bootc-ubuntu-setup@main
+      - uses: bootc-dev/actions/create-manifest@main
+        with:
+          image: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.STAGED_NAME }}
+          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.STAGED_NAME }}:${{ inputs.tag }}
+          artifact-pattern: staged-digests-${{ env.STAGED_NAME }}-${{ inputs.tag }}-*
+          registry-login-env: 'false'
